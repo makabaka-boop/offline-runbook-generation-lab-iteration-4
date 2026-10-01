@@ -6,7 +6,7 @@
  * - 离线读取：手册资源只从“当前激活代际”的 Cache Storage 出；
  *   任何半包/暂存缓存一律不对外提供（见缓存命名前缀）。
  * - 应用壳（同源构建产物）在 install 时预缓存，导航请求离线回退到 /index.html。
- * - IndexedDB 只读取当前代际与安装状态（与页面共享同一条记录）。
+ * - IndexedDB 只读取当前/上一版代际指针与安装状态（与页面共享同一条记录）；服务请求只使用当前指针。
  * 构建期由 plugins/sw-build.ts 通过 esbuild define 注入 SW_VERSION / SW_PRECACHE。
  */
 import { readState } from '../core/idb';

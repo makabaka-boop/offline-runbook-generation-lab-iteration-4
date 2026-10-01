@@ -4,6 +4,8 @@ import { createBrowserPorts } from '../platform/browser-ports';
 import type { Snapshot } from '../core/types';
 
 const coordinator = new InstallerCoordinator(createBrowserPorts());
+const generationChannel =
+  typeof BroadcastChannel === 'function' ? new BroadcastChannel('manual-generation') : null;
 
 /** 单例协调器：整个应用共享同一份安装状态；挂载时执行一次启动恢复。 */
 export function useInstaller(): { snapshot: Snapshot; ready: boolean } {
@@ -20,6 +22,14 @@ export function useInstaller(): { snapshot: Snapshot; ready: boolean } {
     return () => {
       alive = false;
     };
+  }, []);
+
+  useEffect(() => {
+    const onGenerationChanged = () => {
+      void coordinator.refreshFromStorage();
+    };
+    generationChannel?.addEventListener('message', onGenerationChanged);
+    return () => generationChannel?.removeEventListener('message', onGenerationChanged);
   }, []);
 
   const snapshot = useSyncExternalStore(

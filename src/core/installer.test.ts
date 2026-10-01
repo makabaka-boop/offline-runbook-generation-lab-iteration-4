@@ -111,7 +111,27 @@ const makePorts = (bodies: Map<string, string>): FakePorts => {
     },
 
     async loadState() {
-      return JSON.parse(JSON.stringify(this.store)) as PersistedState;
+      const cloned = JSON.parse(JSON.stringify(this.store)) as Partial<PersistedState>;
+      return {
+        activeVersion: typeof cloned.activeVersion === 'string' ? cloned.activeVersion : null,
+        activeCacheName: typeof cloned.activeCacheName === 'string' ? cloned.activeCacheName : null,
+        activeGeneration:
+          typeof cloned.activeGeneration === 'string'
+            ? cloned.activeGeneration
+            : typeof cloned.activeCacheName === 'string'
+              ? cloned.activeCacheName.split(':').pop() ?? null
+              : null,
+        previousVersion: typeof cloned.previousVersion === 'string' ? cloned.previousVersion : null,
+        previousCacheName:
+          typeof cloned.previousCacheName === 'string' ? cloned.previousCacheName : null,
+        previousGeneration:
+          typeof cloned.previousGeneration === 'string'
+            ? cloned.previousGeneration
+            : typeof cloned.previousCacheName === 'string'
+              ? cloned.previousCacheName.split(':').pop() ?? null
+              : null,
+        pending: cloned.pending ?? null,
+      } as PersistedState;
     },
     async saveState(state) {
       this.calls.push('save');
@@ -120,6 +140,22 @@ const makePorts = (bodies: Map<string, string>): FakePorts => {
     async commitStateIfPending(state, expectedGeneration) {
       if (this.store.pending?.installId !== expectedGeneration) return false;
       this.calls.push('commit');
+      this.store = JSON.parse(JSON.stringify(state)) as PersistedState;
+      return true;
+    },
+    async commitRollbackIfActive(state, expected) {
+      const s = this.store;
+      if (
+        s.pending ||
+        s.activeVersion !== expected.activeVersion ||
+        s.activeGeneration !== expected.activeGeneration ||
+        s.activeCacheName !== expected.activeCacheName ||
+        s.previousVersion !== expected.previousVersion ||
+        s.previousGeneration !== expected.previousGeneration ||
+        s.previousCacheName !== expected.previousCacheName
+      ) {
+        return false;
+      }
       this.store = JSON.parse(JSON.stringify(state)) as PersistedState;
       return true;
     },
@@ -391,7 +427,7 @@ describe('InstallerCoordinator 状态协调', () => {
     expect(cachesForV1).toEqual([v1Cache]);
   });
 
-  it('成功升级：新代际激活后旧版缓存与其他孤儿缓存全部回收', async () => {
+  it('成功升级：新代际激活后保留紧邻上一版，其他孤儿缓存全部回收', async () => {
     const v1 = makeEntry('1.0.0');
     const v2 = makeEntry('2.0.0');
     const ports = makePorts(new Map([...v1.bodies, ...v2.bodies]));
@@ -408,8 +444,11 @@ describe('InstallerCoordinator 状态协调', () => {
     expect(c.getSnapshot().activeVersion).toBe('2.0.0');
     expect(c.getSnapshot().status).toMatchObject({ kind: 'activated' });
     const names = await ports.listManualCaches();
-    expect(names).toEqual([ports.store.activeCacheName]);
-    expect(names).not.toContain(v1Cache);
+    expect(names).toHaveLength(2);
+    expect(names).toContain(ports.store.activeCacheName);
+    expect(names).toContain(v1Cache);
+    expect(ports.store.previousVersion).toBe('1.0.0');
+    expect(ports.store.previousCacheName).toBe(v1Cache);
   });
 
   it('摘要复用：下载地址变化时按摘要复制已核验字节；断网只影响变化资源', async () => {
@@ -439,8 +478,8 @@ describe('InstallerCoordinator 状态协调', () => {
     expect(ports.fetchUrls).not.toContain(data.v2.resources[1].url);
     const v2Cache = ports.caches.get(ports.store.activeCacheName!)!;
     expect(v2Cache.has(data.v2.resources[1].url)).toBe(true);
-    expect(await ports.listManualCaches()).toEqual([ports.store.activeCacheName]);
-    expect(ports.caches.has(v1Cache)).toBe(false);
+    expect(await ports.listManualCaches()).toHaveLength(2);
+    expect(ports.caches.has(v1Cache)).toBe(true);
   });
 
   it('摘要复用单项变更：只下载变化资源，随后逐项与整份清单重新校验', async () => {
@@ -533,6 +572,256 @@ describe('InstallerCoordinator 状态协调', () => {
     expect((c.getSnapshot().status as { installId?: string }).installId).toBe(oldInstallId);
   });
 
+  it('退回上一版：复核资源与整单摘要通过后，一次 CAS 交换当前/上一版指针', async () => {
+    const v1 = makeEntry('1.0.0');
+    const v2 = makeEntry('2.0.0');
+    const ports = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    await c.install(v1.entry);
+    await c.install(v2.entry);
+    const v2Cache = ports.store.activeCacheName!;
+    const v1Cache = ports.store.previousCacheName!;
+
+    const review = await c.reviewRollback(v1.entry);
+
+    expect(review).toMatchObject({
+      version: '1.0.0',
+      cacheName: v1Cache,
+      resourceCount: 2,
+      resourcesSha256: v1.entry.resourcesSha256,
+    });
+    expect(c.getSnapshot().status).toMatchObject({ kind: 'rollback-reviewing' });
+    // 复核阶段不切换指针。
+    expect(ports.store.activeVersion).toBe('2.0.0');
+
+    const committed = await c.confirmRollback();
+
+    expect(committed).toBe(true);
+    expect(c.getSnapshot()).toMatchObject({
+      activeVersion: '1.0.0',
+      previousVersion: '2.0.0',
+    });
+    expect(ports.store).toMatchObject({
+      activeVersion: '1.0.0',
+      activeCacheName: v1Cache,
+      previousVersion: '2.0.0',
+      previousCacheName: v2Cache,
+      pending: null,
+    });
+    // 两个缓存都保留，SW 只按新的 active 指针读 v1。
+    expect(ports.caches.has(v1Cache)).toBe(true);
+    expect(ports.caches.has(v2Cache)).toBe(true);
+    expect(c.getSnapshot().status).toMatchObject({ kind: 'rolled-back' });
+  });
+
+  it('升级前只有当前版本的存量记录：可正常启动，但不能退回', async () => {
+    const v1 = makeEntry('1.0.0');
+    const ports = makePorts(v1.bodies);
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    await c.install(v1.entry);
+    expect(await ports.listManualCaches()).toEqual([ports.store.activeCacheName!]);
+
+    ports.store = {
+      activeVersion: ports.store.activeVersion,
+      activeCacheName: ports.store.activeCacheName,
+      activeGeneration: ports.store.activeGeneration,
+      pending: null,
+    } as PersistedState;
+    const reopened = new InstallerCoordinator(ports);
+    await reopened.init();
+
+    expect(reopened.getSnapshot().activeVersion).toBe('1.0.0');
+    expect(reopened.getSnapshot().previousVersion).toBeNull();
+    expect(await reopened.reviewRollback(v1.entry)).toBeNull();
+    expect(reopened.getSnapshot().status).toMatchObject({
+      kind: 'failed',
+      code: 'missing',
+      scope: 'rollback',
+    });
+    expect(ports.store.activeVersion).toBe('1.0.0');
+  });
+
+  it('安装仍在进行时拒绝退回，且不改变当前可用版本', async () => {
+    const v1 = makeEntry('1.0.0');
+    const v2 = makeEntry('2.0.0');
+    const ports = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    ports.setRoute(v2.entry.resources[0].url, { mode: 'hang' });
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    await c.install(v1.entry);
+    const installPromise = c.install(v2.entry);
+    await waitFor(() => c.getSnapshot().status.kind === 'installing');
+
+    expect(await c.reviewRollback(v1.entry)).toBeNull();
+    expect(c.getSnapshot().status).toMatchObject({ kind: 'failed', code: 'busy' });
+    expect(c.getSnapshot().activeVersion).toBe('1.0.0');
+
+    await c.cancel();
+    await installPromise;
+  });
+
+  it('上一版缓存缺失或资源校验失败时拒绝退回，两个缓存均不得被清理', async () => {
+    const v1 = makeEntry('1.0.0');
+    const v2 = makeEntry('2.0.0');
+    const ports = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    await c.install(v1.entry);
+    await c.install(v2.entry);
+    const v1Cache = ports.store.previousCacheName!;
+    const v2Cache = ports.store.activeCacheName!;
+
+    ports.caches.get(v1Cache)!.delete(v1.entry.resources[1].url);
+    expect(await c.reviewRollback(v1.entry)).toBeNull();
+    expect(c.getSnapshot().status).toMatchObject({ kind: 'failed', code: 'missing' });
+    expect(ports.store.activeVersion).toBe('2.0.0');
+    expect(ports.caches.has(v1Cache)).toBe(true);
+    expect(ports.caches.has(v2Cache)).toBe(true);
+
+    const missingCachePorts = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const c2 = new InstallerCoordinator(missingCachePorts);
+    await c2.init();
+    await c2.install(v1.entry);
+    await c2.install(v2.entry);
+    missingCachePorts.caches.delete(missingCachePorts.store.previousCacheName!);
+    expect(await c2.reviewRollback(v1.entry)).toBeNull();
+    expect(c2.getSnapshot().status).toMatchObject({ kind: 'failed', code: 'missing' });
+    expect(missingCachePorts.store.activeVersion).toBe('2.0.0');
+
+    const tamperedPorts = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const c3 = new InstallerCoordinator(tamperedPorts);
+    await c3.init();
+    await c3.install(v1.entry);
+    await c3.install(v2.entry);
+    const oldCache = tamperedPorts.caches.get(tamperedPorts.store.previousCacheName!)!;
+    oldCache.set(
+      v1.entry.resources[0].url,
+      new Response('tampered', { headers: { 'Content-Type': 'application/json' } }),
+    );
+    expect(await c3.reviewRollback(v1.entry)).toBeNull();
+    expect(c3.getSnapshot().status).toMatchObject({ kind: 'failed', code: 'checksum' });
+    expect(tamperedPorts.store.activeVersion).toBe('2.0.0');
+    expect(tamperedPorts.caches.has(tamperedPorts.store.previousCacheName!)).toBe(true);
+
+    // 复核通过后、确认前再次篡改：迟到确认仍必须拒绝，不能切换到损坏缓存。
+    const latePorts = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const c4 = new InstallerCoordinator(latePorts);
+    await c4.init();
+    await c4.install(v1.entry);
+    await c4.install(v2.entry);
+    await c4.reviewRollback(v1.entry);
+    latePorts.caches
+      .get(latePorts.store.previousCacheName!)!
+      .set(v1.entry.resources[1].url, new Response('late-corrupt', { headers: { 'Content-Type': 'application/json' } }));
+    expect(await c4.confirmRollback()).toBe(false);
+    expect(c4.getSnapshot().status).toMatchObject({ kind: 'failed', code: 'checksum' });
+    expect(latePorts.store.activeVersion).toBe('2.0.0');
+  });
+
+  it('另一标签页已完成切换时，迟到的退回确认不能覆盖新代际', async () => {
+    const v1 = makeEntry('1.0.0');
+    const v2 = makeEntry('2.0.0');
+    const ports = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    await c.install(v1.entry);
+    await c.install(v2.entry);
+    const v1Cache = ports.store.previousCacheName!;
+    const v2Cache = ports.store.activeCacheName!;
+
+    await c.reviewRollback(v1.entry);
+
+    // 另一个标签页已先完成一次退回；当前 IDB 为 v1 active、v2 previous。
+    ports.store = {
+      activeVersion: '1.0.0',
+      activeCacheName: v1Cache,
+      activeGeneration: ports.store.previousGeneration!,
+      previousVersion: '2.0.0',
+      previousCacheName: v2Cache,
+      previousGeneration: ports.store.activeGeneration!,
+      pending: null,
+    };
+
+    expect(await c.confirmRollback()).toBe(false);
+    expect(c.getSnapshot().status).toMatchObject({ kind: 'failed', code: 'stale' });
+    expect(ports.store.activeVersion).toBe('1.0.0');
+    expect(ports.store.activeCacheName).toBe(v1Cache);
+  });
+
+  it('另一标签页已安装并切到新代际时，迟到的退回确认不能覆盖新代际', async () => {
+    const v1 = makeEntry('1.0.0');
+    const v2 = makeEntry('2.0.0');
+    const ports = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const tabA = new InstallerCoordinator(ports);
+    await tabA.init();
+    await tabA.install(v1.entry);
+    await tabA.install(v2.entry);
+    await tabA.reviewRollback(v1.entry);
+
+    // 另一个标签页没有进行中的回滚，直接重装同代际以外的新安装也会改变 activeGeneration。
+    const tabB = new InstallerCoordinator(ports);
+    await tabB.init();
+    await tabB.install(v1.entry);
+
+    expect(await tabA.confirmRollback()).toBe(false);
+    expect(tabA.getSnapshot().status).toMatchObject({ kind: 'failed', code: 'stale' });
+    expect(ports.store.activeVersion).toBe('1.0.0');
+    expect(ports.store.previousVersion).toBe('2.0.0');
+  });
+
+  it('存储故障导致复核/原子提交失败时拒绝退回并保留当前版本与缓存', async () => {
+    const v1 = makeEntry('1.0.0');
+    const v2 = makeEntry('2.0.0');
+    const ports = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    await c.install(v1.entry);
+    await c.install(v2.entry);
+    const v1Cache = ports.store.previousCacheName!;
+    const v2Cache = ports.store.activeCacheName!;
+
+    const originalOpen = ports.openCache.bind(ports);
+    ports.openCache = (name) =>
+      name === v1Cache ? Promise.reject(new Error('cache unavailable')) : originalOpen(name);
+
+    expect(await c.reviewRollback(v1.entry)).toBeNull();
+    expect(c.getSnapshot().status).toMatchObject({ kind: 'failed', code: 'unknown' });
+    expect(ports.store.activeVersion).toBe('2.0.0');
+    expect(ports.caches.has(v1Cache)).toBe(true);
+    expect(ports.caches.has(v2Cache)).toBe(true);
+
+    ports.openCache = originalOpen;
+    await c.reviewRollback(v1.entry);
+    const originalCommit = ports.commitRollbackIfActive.bind(ports);
+    ports.commitRollbackIfActive = () => Promise.reject(new Error('IDB down'));
+    expect(await c.confirmRollback()).toBe(false);
+    expect(c.getSnapshot().status).toMatchObject({ kind: 'failed', code: 'unknown' });
+    expect(ports.store.activeVersion).toBe('2.0.0');
+    ports.commitRollbackIfActive = originalCommit;
+  });
+
+  it('退回后再次成功安装：仍最多保留当前版与紧邻上一版', async () => {
+    const v1 = makeEntry('1.0.0');
+    const v2 = makeEntry('2.0.0');
+    const ports = makePorts(new Map([...v1.bodies, ...v2.bodies]));
+    const c = new InstallerCoordinator(ports);
+    await c.init();
+    await c.install(v1.entry);
+    await c.install(v2.entry);
+    await c.reviewRollback(v1.entry);
+    await c.confirmRollback();
+
+    await c.install(v2.entry);
+
+    expect(c.getSnapshot().activeVersion).toBe('2.0.0');
+    expect(ports.store.previousVersion).toBe('1.0.0');
+    const names = await ports.listManualCaches();
+    expect(names).toHaveLength(2);
+    expect(names).toContain(ports.store.activeCacheName);
+    expect(names).toContain(ports.store.previousCacheName);
+  });
 
   it('重复发起安装被忽略，同一时刻只有一个安装', async () => {
     const v1 = makeEntry('1.0.0');

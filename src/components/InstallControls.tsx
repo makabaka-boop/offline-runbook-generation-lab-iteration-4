@@ -1,4 +1,4 @@
-import type { CatalogEntry, FailureCode, InstallMode } from '../core/types';
+import type { CatalogEntry, FailureCode, InstallMode, InstallerStatus } from '../core/types';
 
 export interface InstallProgress {
   installId: string;
@@ -18,6 +18,7 @@ export interface InstallFailure {
   installId?: string;
   version: string | null;
   code: FailureCode;
+  scope?: 'install' | 'rollback';
 }
 
 export interface ActivatedInfo {
@@ -32,7 +33,6 @@ export interface InstallControlsProps {
   installing: InstallProgress | null;
   failed: InstallFailure | null;
   activated?: ActivatedInfo | null;
-  failureText: Record<FailureCode, string>;
   onInstall: (version: string, mode: InstallMode) => void;
   onCancel: () => void;
 }
@@ -58,7 +58,7 @@ export function VersionCard({
 }) {
   const isActive = entry.version === activeVersion;
   const isInstallingThis = installing?.version === entry.version;
-  const failedHere = failed?.version === entry.version;
+  const failedHere = failed?.version === entry.version && failed.scope !== 'rollback';
   const otherInstalling = installing !== null && installing.version !== entry.version;
 
   return (
@@ -137,7 +137,91 @@ const failureTextOf = (code: FailureCode): string => {
     network: '下载中断或网络不可用，未激活缓存已清理',
     quota: '存储空间配额异常，未激活缓存已清理',
     canceled: '安装已取消，未激活缓存已清理',
-    unknown: '安装发生未知错误，未激活缓存已清理',
+    busy: '安装仍在进行，不能退回版本；当前可用版本保持不变',
+    missing: '上一版完整缓存缺失，不能退回；当前可用版本保持不变',
+    stale: '退回确认已过期：另一标签页已完成切换，未覆盖新代际',
+    unknown: '发生未知错误',
   };
   return map[code];
 };
+
+interface RollbackControlsProps {
+  activeVersion: string;
+  previousVersion: string | null;
+  previousTitle: string;
+  status: Extract<InstallerStatus, { kind: 'rollback-reviewing' }> | null;
+  installing: InstallProgress | null;
+  swReady: boolean;
+  onReview: () => void;
+  onConfirm: () => void;
+  onCancelReview: () => void;
+}
+
+export function RollbackControls({
+  activeVersion,
+  previousVersion,
+  previousTitle,
+  status,
+  installing,
+  swReady,
+  onReview,
+  onConfirm,
+  onCancelReview,
+}: RollbackControlsProps) {
+  const review = status?.review ?? null;
+  const reviewingThis = review?.version === previousVersion;
+
+  return (
+    <div className="panel" data-testid="rollback-panel">
+      <h2>退回上一已核验版本</h2>
+      <div className="small" style={{ marginBottom: 10 }}>
+        成功安装后最多只保留当前版与紧邻上一版。退回会先离线复核上一版缓存的每个资源与整单摘要，
+        确认后才一次切换 IndexedDB 激活代际；Service Worker、步骤页和演练会话随后都指向上一版。
+      </div>
+
+      {!previousVersion && (
+        <div className="banner warn" data-testid="rollback-unavailable">
+          当前只有版本 {activeVersion} 的存量完整记录，可正常离线启动；暂无紧邻上一版，暂不能退回。
+        </div>
+      )}
+
+      {previousVersion && !reviewingThis && (
+        <div className="row" style={{ gap: 8, justifyContent: 'space-between' }}>
+          <div>
+            <strong data-testid="rollback-previous-version">上一版：{previousVersion}</strong>
+            <div className="small">{previousTitle}</div>
+          </div>
+          <button
+            className="primary"
+            data-testid="rollback-review"
+            disabled={!swReady || installing !== null}
+            title={installing ? '安装仍在进行时不能退回' : '复核上一版缓存与整单摘要'}
+            onClick={onReview}
+          >
+            复核上一版
+          </button>
+        </div>
+      )}
+
+      {previousVersion && reviewingThis && review && (
+        <div data-testid="rollback-confirmation">
+          <div className="banner ok">
+            复核通过：版本 {review.version} 的 {review.resourceCount} 个资源均可从本地缓存读取，
+            SHA-256 逐项一致。
+            <div className="small" data-testid="rollback-digest">
+              整单摘要：{review.resourcesSha256}
+            </div>
+          </div>
+          <div className="row" style={{ gap: 8 }}>
+            <button className="primary" data-testid="rollback-confirm" onClick={onConfirm}>
+              确认退回 {review.version}
+            </button>
+            <button data-testid="rollback-cancel" onClick={onCancelReview}>
+              取消，保留 {activeVersion}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

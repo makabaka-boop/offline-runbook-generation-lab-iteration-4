@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { coordinator, useInstaller } from '../state/use-installer';
 import { catalog, findEntry, loadManual, type ManualBundle } from '../manuals';
-import type { FailureCode, InstallMode } from '../core/types';
+import type { FailureCode, InstallMode, InstallerStatus } from '../core/types';
 import { FAILURE_TEXT } from '../core/types';
 import { NoPackage } from './NoPackage';
 import { Workshop } from './Workshop';
@@ -49,11 +49,18 @@ export function Booted({ swReady }: Props) {
   const installing = snapshot.status.kind === 'installing' ? snapshot.status : null;
   const failed = snapshot.status.kind === 'failed' ? snapshot.status : null;
   const activated = snapshot.status.kind === 'activated' ? snapshot.status : null;
+  const rolledBack = snapshot.status.kind === 'rolled-back' ? snapshot.status : null;
 
   const activeCatalogEntry = useMemo(
     () => (active ? findEntry(active) : undefined),
     [active],
   );
+  const previousCatalogEntry = useMemo(
+    () => (snapshot.previousVersion ? findEntry(snapshot.previousVersion) : undefined),
+    [snapshot.previousVersion],
+  );
+  const rollbackStatus =
+    snapshot.status.kind === 'rollback-reviewing' ? snapshot.status : null;
 
   const startInstall = (version: string, mode: InstallMode) => {
     const entry = findEntry(version);
@@ -62,6 +69,15 @@ export function Booted({ swReady }: Props) {
       mode,
       activeEntry: mode === 'reuse' ? activeCatalogEntry ?? null : null,
     });
+  };
+
+  const reviewRollback = () => {
+    const entry = previousCatalogEntry;
+    if (entry) void coordinator.reviewRollback(entry);
+  };
+
+  const confirmRollback = () => {
+    void coordinator.confirmRollback();
   };
 
   if (!ready) {
@@ -97,8 +113,15 @@ export function Booted({ swReady }: Props) {
       bundleVersion={bundleVersion}
       loadError={loadError}
       installing={installing}
-      failed={failed as { version: string | null; code: FailureCode } | null}
+      failed={failed as { version: string | null; code: FailureCode; scope?: 'install' | 'rollback' } | null}
       activated={activated}
+      rolledBack={rolledBack}
+      previousVersion={snapshot.previousVersion}
+      previousTitle={previousCatalogEntry?.title ?? ''}
+      rollbackStatus={rollbackStatus as Extract<InstallerStatus, { kind: 'rollback-reviewing' }> | null}
+      onReviewRollback={reviewRollback}
+      onConfirmRollback={confirmRollback}
+      onCancelRollbackReview={() => coordinator.cancelRollbackReview()}
       failureText={FAILURE_TEXT}
       switchNotice={switchNotice}
       dismissSwitchNotice={() => setSwitchNotice(false)}

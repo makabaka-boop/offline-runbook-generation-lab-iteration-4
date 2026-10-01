@@ -60,6 +60,15 @@ export async function readState(db?: IDBDatabase): Promise<PersistedState> {
           : activeCacheName
             ? generationFromCacheName(activeCacheName)
             : null,
+      previousVersion: typeof s.previousVersion === 'string' ? s.previousVersion : null,
+      previousCacheName:
+        typeof s.previousCacheName === 'string' ? s.previousCacheName : null,
+      previousGeneration:
+        typeof s.previousGeneration === 'string'
+          ? s.previousGeneration
+          : typeof s.previousCacheName === 'string'
+            ? generationFromCacheName(s.previousCacheName)
+            : null,
       pending:
         s.pending &&
         typeof s.pending === 'object' &&
@@ -125,6 +134,55 @@ export async function commitStateIfPending(
       tx.oncomplete = () => resolve(committed);
       tx.onerror = () => reject(tx.error ?? new Error('IndexedDB 提交失败'));
       tx.onabort = () => reject(tx.error ?? new Error('IndexedDB 提交中止'));
+    });
+  } finally {
+    if (owned) handle.close();
+  }
+}
+
+export async function commitRollbackIfActive(
+  state: PersistedState,
+  expected: {
+    activeVersion: string;
+    activeGeneration: string;
+    activeCacheName: string;
+    previousVersion: string;
+    previousGeneration: string;
+    previousCacheName: string;
+  },
+  db?: IDBDatabase,
+): Promise<boolean> {
+  const owned = !db;
+  const handle = db ?? (await openStateDb());
+  try {
+    return await new Promise<boolean>((resolve, reject) => {
+      const tx = handle.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      let committed = false;
+      const req = store.get(KEY);
+      req.onsuccess = () => {
+        const current =
+          req.result && typeof req.result === 'object'
+            ? (req.result as Partial<PersistedState>)
+            : {};
+        if (
+          current.pending ||
+          current.activeVersion !== expected.activeVersion ||
+          current.activeGeneration !== expected.activeGeneration ||
+          current.activeCacheName !== expected.activeCacheName ||
+          current.previousVersion !== expected.previousVersion ||
+          current.previousGeneration !== expected.previousGeneration ||
+          current.previousCacheName !== expected.previousCacheName
+        ) {
+          return;
+        }
+        store.put(state, KEY);
+        committed = true;
+      };
+      req.onerror = () => reject(req.error);
+      tx.oncomplete = () => resolve(committed);
+      tx.onerror = () => reject(tx.error ?? new Error('IndexedDB 退回提交失败'));
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB 退回提交中止'));
     });
   } finally {
     if (owned) handle.close();

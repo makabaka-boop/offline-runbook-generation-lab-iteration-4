@@ -61,6 +61,31 @@ test.describe('离线演练', () => {
     await expect(page.getByTestId('pass-code')).toContainText('PASS-2.0.0-');
   });
 
+  test('切换版本后，旧版本已通过结论失效；退回后当前版结论仍只认当前版本', async ({ page }) => {
+    // 在 v2 完成一条演练，随后退回到 v1：旧通过结论必须消失并提示失效。
+    await page.getByTestId('tab-steps').click();
+    await page.getByTestId('install-2.0.0').click();
+    await expect(page.getByTestId('current-version')).toContainText('2.0.0');
+    await page.getByTestId('tab-drill').click();
+    await page.getByTestId('fault-search').fill('STS');
+    await page.getByTestId('fault-v2-sts-failover').click();
+    for (let i = 0; i < 4; i++) {
+      await page.getByTestId(`action-v2-sts-failover-${i}`).click();
+    }
+    await expect(page.getByTestId('pass-box')).toContainText('绑定版本 2.0.0');
+    await expect(page.getByTestId('pass-history')).toContainText('版本 2.0.0');
+
+    await page.getByTestId('tab-steps').click();
+    await page.getByTestId('rollback-review').click();
+    await page.getByTestId('rollback-confirm').click();
+    await expect(page.getByTestId('current-version')).toContainText('1.0.0');
+    await expect(page.getByTestId('records-invalidated')).toContainText('版本 2.0.0');
+    await page.getByTestId('tab-drill').click();
+    await expect(page.getByTestId('pass-history')).toHaveCount(0);
+    await page.getByTestId('fault-search').fill('UPS');
+    await expect(page.getByTestId('fault-v1-ups-overload')).toBeVisible();
+  });
+
   test('离线状态下演练照常进行（SW 提供当前版条目）', async ({ page, context }) => {
     await page.getByTestId('fault-search').fill('跳闸');
     await page.getByTestId('fault-v1-pdu-trip').click();

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FaultEntry } from '../core/types';
 import {
   buildPassRecord,
@@ -16,25 +16,49 @@ interface Props {
   entries: FaultEntry[];
   /** 未完成演练因版本切换被终止时回调（由父级持久展示提示）。 */
   onTerminated: (previousVersion: string) => void;
+  /** 已通过但绑定旧版本的结论在切换后失效时回调。 */
+  onRecordsInvalidated: (previousVersion: string, count: number) => void;
 }
 
-export function DrillPanel({ version, entries, onTerminated }: Props) {
+export function DrillPanel({ version, entries, onTerminated, onRecordsInvalidated }: Props) {
   const [session, setSession] = useState<DrillSession | null>(null);
   const [query, setQuery] = useState('');
   const [records, setRecords] = useState<PassRecord[]>([]);
+  const previousVersionRef = useRef(version);
+  const sessionRef = useRef<DrillSession | null>(null);
+  const recordsRef = useRef<PassRecord[]>([]);
 
-  // 版本切换：未完成（已选条目且未通过）的演练一律终止并提示；已通过结论保留在 records。
   useEffect(() => {
-    setSession((current) => {
-      if (current && current.version !== version) {
-        if (current.selectedEntryId !== null && !current.passed) {
-          onTerminated(current.version);
-        }
-        return startDrill(version);
-      }
-      return current ?? startDrill(version);
-    });
+    sessionRef.current = session;
+  }, [session]);
+  useEffect(() => {
+    recordsRef.current = records;
+  }, [records]);
+
+  // 版本切换：未完成演练终止；旧版本的通过结论不再作为当前版结论，全部失效并清空。
+  useEffect(() => {
+    const previousVersion = previousVersionRef.current;
+    if (previousVersion === version) return;
+
+    const previousSession = sessionRef.current;
+    if (
+      previousSession?.version === previousVersion &&
+      previousSession.selectedEntryId !== null &&
+      !previousSession.passed
+    ) {
+      onTerminated(previousVersion);
+    }
+
+    const staleRecords = recordsRef.current;
+    if (staleRecords.length > 0) {
+      const staleCount = staleRecords.filter((record) => record.version === previousVersion).length;
+      onRecordsInvalidated(previousVersion, staleCount);
+      setRecords([]);
+    }
+
+    setSession(startDrill(version));
     setQuery('');
+    previousVersionRef.current = version;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [version]);
 

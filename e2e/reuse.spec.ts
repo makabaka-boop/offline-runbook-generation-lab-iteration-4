@@ -22,7 +22,7 @@ test.describe('按内容摘要复用安装', () => {
     await expect(page.getByTestId('step-1')).toContainText('已有已核验离线包');
     await expect(page.getByTestId('step-9')).toBeVisible();
 
-    // 新版暂存区自包含 v3 的新地址；激活后旧版缓存已回收，不允许继续引用旧缓存。
+    // 新版暂存区自包含 v3 的新地址；激活后仅保留 v3 当前版与 v2 紧邻上一版两个缓存。
     const cacheState = await page.evaluate(async () => {
       const stateReq = indexedDB.open('manual-kiosk-db');
       const state = await new Promise<{ activeVersion: string | null; activeCacheName: string | null }>((resolve, reject) => {
@@ -48,7 +48,7 @@ test.describe('按内容摘要复用安装', () => {
       };
     });
     expect(cacheState.activeVersion).toBe('3.0.0');
-    expect(cacheState.manualNames).toHaveLength(1);
+    expect(cacheState.manualNames).toHaveLength(2);
     expect(cacheState.hasV3Faults).toBe(true);
     expect(cacheState.hasV2FaultsInActive).toBe(false);
 

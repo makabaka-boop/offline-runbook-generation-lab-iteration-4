@@ -7,8 +7,9 @@
  *    以及安装中关闭后重开，都只清理该未激活缓存。
  * 3. 已激活的完整版本在失败/中断期间继续保留并可读；从无成功安装则 activeVersion=null，
  *    界面显示“无可用离线包”。
- * 4. IndexedDB 的代际切换先于旧缓存删除（崩溃也只会留下孤儿缓存，下次启动回收）。
- * 5. 摘要复用只从当前激活代际复制字节到新暂存区；新代际激活后不引用旧缓存。
+ * 4. IndexedDB 的代际切换先于缓存回收（崩溃也只会留下孤儿缓存，下次启动回收）。
+ * 5. 摘要复用只从当前激活代际复制字节到新暂存区；新代际激活后拥有独立缓存，成功后最多保留当前与紧邻上一版。
+ * 6. 退回只在复核上一版全部资源与整单摘要后执行一次 CAS 指针交换；失败时不清理任一已激活缓存。
  */
 import type {
   CatalogEntry,
@@ -16,11 +17,13 @@ import type {
   InstallMode,
   PersistedState,
   ResourceRef,
+  RollbackReview,
   Snapshot,
 } from './types';
 import { INITIAL_PERSISTED_STATE } from './types';
 import { encodeCanonicalResourceList } from './resource-digest';
 import {
+  installGenerationFromCacheName,
   stageCacheNameFor,
   type InstallGeneration,
 } from './generation';
@@ -55,6 +58,24 @@ export class StaleGenerationError extends Error {
     this.name = 'StaleGenerationError';
   }
 }
+export class RollbackBusyError extends Error {
+  constructor() {
+    super('安装仍在进行，不能退回');
+    this.name = 'RollbackBusyError';
+  }
+}
+export class RollbackMissingError extends Error {
+  constructor() {
+    super('上一版完整缓存缺失');
+    this.name = 'RollbackMissingError';
+  }
+}
+export class StaleRollbackError extends Error {
+  constructor() {
+    super('退回确认已过期');
+    this.name = 'StaleRollbackError';
+  }
+}
 
 export interface StagedResource {
   bytes: Uint8Array;
@@ -69,6 +90,18 @@ export interface InstallerPorts {
   commitStateIfPending(
     state: PersistedState,
     expectedGeneration: string,
+  ): Promise<boolean>;
+  /** 仅当当前/上一版指针与复核时完全一致且无安装进行时，原子交换两代际。 */
+  commitRollbackIfActive(
+    state: PersistedState,
+    expected: {
+      activeVersion: string;
+      activeGeneration: string;
+      activeCacheName: string;
+      previousVersion: string;
+      previousGeneration: string;
+      previousCacheName: string;
+    },
   ): Promise<boolean>;
   /** 下载单个资源；AbortSignal 触发时应拒绝 AbortError/Canceled。 */
   fetchResource(
@@ -99,6 +132,9 @@ type Listener = (snapshot: Snapshot) => void;
 const toFailureCode = (err: unknown): FailureCode => {
   if (err instanceof ChecksumError) return 'checksum';
   if (err instanceof Canceled || err instanceof StaleGenerationError) return 'canceled';
+  if (err instanceof RollbackBusyError) return 'busy';
+  if (err instanceof RollbackMissingError) return 'missing';
+  if (err instanceof StaleRollbackError) return 'stale';
   if (err instanceof QuotaError) return 'quota';
   if (err instanceof HttpError) return 'network';
   if (err instanceof Error) {
@@ -106,6 +142,9 @@ const toFailureCode = (err: unknown): FailureCode => {
     if (name === 'AbortError' || name === 'Canceled' || name === 'StaleGenerationError') {
       return 'canceled';
     }
+    if (name === 'RollbackBusyError') return 'busy';
+    if (name === 'RollbackMissingError') return 'missing';
+    if (name === 'StaleRollbackError') return 'stale';
     if (
       name === 'QuotaExceededError' ||
       /quota|exceeded/i.test(err.message)
@@ -134,8 +173,17 @@ interface InstallAttempt {
 
 export class InstallerCoordinator {
   private state: PersistedState = { ...INITIAL_PERSISTED_STATE };
-  private snapshot: Snapshot = { activeVersion: null, status: { kind: 'idle' } };
+  private snapshot: Snapshot = {
+    activeVersion: null,
+    activeGeneration: null,
+    previousVersion: null,
+    previousGeneration: null,
+    status: { kind: 'idle' },
+  };
   private current: InstallAttempt | null = null;
+  private rollbackReview: (RollbackReview & { fromVersion: string; fromGeneration: string }) | null = null;
+  private rollbackEntry: CatalogEntry | null = null;
+  private generationChannel: BroadcastChannel | null = null;
   /** 当前安装尝试使用的激活版本目录条目；仅按其中资源摘要定位旧版字节。 */
   private activeCatalogEntry: CatalogEntry | null = null;
   private listeners = new Set<Listener>();
@@ -153,13 +201,23 @@ export class InstallerCoordinator {
     return this.snapshot;
   }
 
+  private snapshotFrom(status: Snapshot['status']): Snapshot {
+    return {
+      activeVersion: this.state.activeVersion,
+      activeGeneration: this.state.activeGeneration,
+      previousVersion: this.state.previousVersion,
+      previousGeneration: this.state.previousGeneration,
+      status,
+    };
+  }
+
   private emit() {
-    this.snapshot = { activeVersion: this.state.activeVersion, status: this.snapshot.status };
+    this.snapshot = this.snapshotFrom(this.snapshot.status);
     for (const fn of this.listeners) fn(this.snapshot);
   }
 
   private setStatus(status: Snapshot['status']) {
-    this.snapshot = { activeVersion: this.state.activeVersion, status };
+    this.snapshot = this.snapshotFrom(status);
     this.emit();
   }
 
@@ -174,6 +232,11 @@ export class InstallerCoordinator {
     return this.initPromise;
   }
 
+  private clearRollbackReview() {
+    this.rollbackReview = null;
+    this.rollbackEntry = null;
+  }
+
   private async initOnce(): Promise<void> {
     const state = await this.ports.loadState();
     if (state.pending) {
@@ -182,13 +245,18 @@ export class InstallerCoordinator {
       await this.ports.saveState(state);
     }
     this.state = state;
+    this.clearRollbackReview();
     await this.reconcileCaches();
-    this.snapshot = { activeVersion: state.activeVersion, status: { kind: 'idle' } };
+    this.snapshot = this.snapshotFrom({ kind: 'idle' });
     this.emit();
   }
 
   private async reconcileCaches() {
-    const keep = this.state.activeCacheName;
+    const keep = new Set(
+      [this.state.activeCacheName, this.state.previousCacheName].filter(
+        (name): name is string => Boolean(name),
+      ),
+    );
     let names: string[] = [];
     try {
       names = await this.ports.listManualCaches();
@@ -197,7 +265,7 @@ export class InstallerCoordinator {
     }
     await Promise.all(
       names
-        .filter((name) => name !== keep && name.startsWith('manual:'))
+        .filter((name) => !keep.has(name) && name.startsWith('manual:'))
         .map((name) => this.safeDelete(name)),
     );
   }
@@ -234,6 +302,7 @@ export class InstallerCoordinator {
 
     const mode: InstallMode = options.mode === 'reuse' ? 'reuse' : 'full';
     this.activeCatalogEntry = options.activeEntry ?? null;
+    this.clearRollbackReview();
     const total = entry.resources.length;
     const version = entry.version;
     const installId = `${this.ports.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -307,18 +376,32 @@ export class InstallerCoordinator {
       }
 
       // 原子切换：全部资源、逐项摘要、整单摘要均通过后才提交新代际。
+      // 成功后最多保留新版和紧邻的旧当前版；更早或无关的缓存只能在指针切换后回收。
+      const replacingDifferentVersion =
+        this.state.activeVersion && this.state.activeVersion !== version;
+      const previous = replacingDifferentVersion
+        ? {
+            version: this.state.activeVersion as string,
+            cacheName: this.state.activeCacheName as string,
+            generation: this.state.activeGeneration as string,
+          }
+        : null;
       const nextState: PersistedState = {
         activeVersion: version,
         activeCacheName: cacheName,
         activeGeneration: installId,
+        previousVersion: previous?.version ?? null,
+        previousCacheName: previous?.cacheName ?? null,
+        previousGeneration: previous?.generation ?? null,
         pending: null,
       };
       const committed = await this.ports.commitStateIfPending(nextState, installId);
       if (!committed) throw new StaleGenerationError();
       this.state = nextState;
 
-      // 代际已持久提交，再回收旧版与任何其他孤儿缓存（仅保留新激活缓存）。
+      // 代际已持久提交，再回收当前/上一版之外的任何孤儿缓存。
       await this.reconcileCaches();
+      this.notifyGenerationChanged();
 
       this.current = null;
       this.setStatus({ kind: 'activated', installId, version });
@@ -326,6 +409,214 @@ export class InstallerCoordinator {
       this.current = null;
       await this.failInstallation(attempt, err);
     }
+  }
+
+  /**
+   * 退回前复核：逐资源读取上一版缓存中的落盘字节，逐项 SHA-256 校验，
+   * 再核对整份资源清单摘要。复核期间不修改 IDB、不删除/切换任何缓存。
+   */
+  async reviewRollback(entry: CatalogEntry): Promise<RollbackReview | null> {
+    await this.init();
+    try {
+      const state = await this.ports.loadState();
+      this.state = state;
+      if (this.current || state.pending) throw new RollbackBusyError();
+      if (
+        !state.activeVersion ||
+        !state.activeCacheName ||
+        !state.activeGeneration ||
+        !state.previousVersion ||
+        !state.previousCacheName ||
+        !state.previousGeneration
+      ) {
+        throw new RollbackMissingError();
+      }
+
+      const targetEntry = entry;
+      if (!targetEntry || targetEntry.version !== state.previousVersion) {
+        throw new RollbackMissingError();
+      }
+
+      const parsedCacheName = installGenerationFromCacheName(state.previousCacheName);
+      if (!parsedCacheName) {
+        throw new RollbackMissingError();
+      }
+      if (
+        parsedCacheName.version !== state.previousVersion ||
+        parsedCacheName.installId !== state.previousGeneration
+      ) {
+        throw new RollbackMissingError();
+      }
+
+      const cache = await this.ports.openCache(state.previousCacheName);
+      for (const ref of targetEntry.resources) {
+        const storedEntry = await cache.get(ref.url);
+        if (!storedEntry) throw new RollbackMissingError();
+        const actual = normalizeHash(await this.ports.sha256(storedEntry.bytes));
+        if (actual !== normalizeHash(ref.sha256)) {
+          throw new ChecksumError(ref.url);
+        }
+      }
+
+      const resourcesActual = normalizeHash(
+        await this.ports.sha256(encodeCanonicalResourceList(targetEntry.resources)),
+      );
+      if (resourcesActual !== normalizeHash(targetEntry.resourcesSha256)) {
+        throw new ChecksumError('catalog-resources');
+      }
+
+      const review: RollbackReview = {
+        version: state.previousVersion,
+        cacheName: state.previousCacheName,
+        generation: state.previousGeneration,
+        resourceCount: targetEntry.resources.length,
+        resourcesSha256: targetEntry.resourcesSha256,
+      };
+      this.rollbackEntry = targetEntry;
+      this.rollbackReview = {
+        ...review,
+        fromVersion: state.activeVersion,
+        fromGeneration: state.activeGeneration,
+      };
+      this.setStatus({ kind: 'rollback-reviewing', review });
+      return review;
+    } catch (err) {
+      await this.failRollback(err, entry.version);
+      return null;
+    }
+  }
+
+  /** 确认退回：在复核通过后执行一次 IndexedDB CAS，并同步交换当前/上一版指针。 */
+  async confirmRollback(): Promise<boolean> {
+    await this.init();
+    const review = this.rollbackReview;
+    try {
+      if (this.current) throw new RollbackBusyError();
+      if (!review) throw new RollbackMissingError();
+
+      const state = await this.ports.loadState();
+      this.state = state;
+      if (state.pending) throw new RollbackBusyError();
+      if (
+        state.activeVersion !== review.fromVersion ||
+        state.activeGeneration !== review.fromGeneration ||
+        state.activeCacheName === null ||
+        state.previousVersion !== review.version ||
+        state.previousGeneration !== review.generation ||
+        state.previousCacheName !== review.cacheName
+      ) {
+        throw new StaleRollbackError();
+      }
+
+      // 确认前再次复核缓存，确保用户停留期间字节没有损坏；此步之后立即 CAS，不做清理。
+      const targetEntry = this.rollbackEntry;
+      if (!targetEntry || targetEntry.version !== review.version) {
+        throw new RollbackMissingError();
+      }
+      const cache = await this.ports.openCache(review.cacheName);
+      for (const ref of targetEntry.resources) {
+        const storedEntry = await cache.get(ref.url);
+        if (!storedEntry) throw new RollbackMissingError();
+        const actual = normalizeHash(await this.ports.sha256(storedEntry.bytes));
+        if (actual !== normalizeHash(ref.sha256)) throw new ChecksumError(ref.url);
+      }
+      const resourcesActual = normalizeHash(
+        await this.ports.sha256(encodeCanonicalResourceList(targetEntry.resources)),
+      );
+      if (resourcesActual !== normalizeHash(targetEntry.resourcesSha256)) {
+        throw new ChecksumError('catalog-resources');
+      }
+
+      const currentCacheName = state.activeCacheName;
+      const currentGeneration = state.activeGeneration;
+      const nextState: PersistedState = {
+        activeVersion: review.version,
+        activeCacheName: review.cacheName,
+        activeGeneration: review.generation,
+        previousVersion: review.fromVersion,
+        previousCacheName: currentCacheName,
+        previousGeneration: currentGeneration,
+        pending: null,
+      };
+      const committed = await this.ports.commitRollbackIfActive(nextState, {
+        activeVersion: review.fromVersion,
+        activeGeneration: review.fromGeneration,
+        activeCacheName: currentCacheName,
+        previousVersion: review.version,
+        previousGeneration: review.generation,
+        previousCacheName: review.cacheName,
+      });
+      if (!committed) throw new StaleRollbackError();
+
+      this.state = await this.ports.loadState();
+      this.clearRollbackReview();
+      // 交换后保留的仍是当前与紧邻上一版；无需删除缓存，SW 只读新的 active 指针。
+      this.notifyGenerationChanged();
+      this.setStatus({
+        kind: 'rolled-back',
+        version: review.version,
+        fromVersion: review.fromVersion,
+        generation: review.generation,
+      });
+      return true;
+    } catch (err) {
+      await this.failRollback(err, review?.version ?? null);
+      return false;
+    }
+  }
+
+  cancelRollbackReview(): void {
+    if (!this.rollbackReview) return;
+    this.clearRollbackReview();
+    this.setStatus({ kind: 'idle' });
+  }
+
+  private reviewSnapshot(): RollbackReview {
+    const review = this.rollbackReview!;
+    const { version, cacheName, generation, resourceCount, resourcesSha256 } = review;
+    return { version, cacheName, generation, resourceCount, resourcesSha256 };
+  }
+
+  private notifyGenerationChanged() {
+    if (typeof BroadcastChannel !== 'function') return;
+    try {
+      if (!this.generationChannel) {
+        this.generationChannel = new BroadcastChannel('manual-generation');
+      }
+      this.generationChannel.postMessage({
+        type: 'generation-changed',
+        activeVersion: this.state.activeVersion,
+        activeGeneration: this.state.activeGeneration,
+      });
+    } catch {
+      // 跨标签即时刷新是便利能力；IndexedDB CAS 已保证正确性。
+    }
+  }
+
+  /**
+   * 另一个标签页完成安装/退回后的跨标签同步。
+   * 不中断本标签正在运行的安装；安装尝试在 CAS 阶段仍会按 pending/generation 被拒绝。
+   */
+  async refreshFromStorage(): Promise<void> {
+    if (this.current) return;
+    const stored = await this.ports.loadState().catch(() => null);
+    if (!stored) return;
+    this.state = stored;
+    // 保留本地已打开的确认单；即使其他标签页已切换，确认单仍保留给用户点击，
+    // 点击时由 CAS 返回 stale，明确告知迟到操作未覆盖新代际。安装会主动废弃确认单。
+    if (this.rollbackReview) {
+      this.setStatus({ kind: 'rollback-reviewing', review: this.reviewSnapshot() });
+    } else {
+      this.setStatus({ kind: 'idle' });
+    }
+  }
+
+  private async failRollback(err: unknown, targetVersion: string | null) {
+    // 任何退回失败都不得清理当前版或候选上一版缓存；只刷新状态，拒绝本次操作。
+    this.clearRollbackReview();
+    this.state = await this.ports.loadState().catch(() => this.state);
+    const code: FailureCode = toFailureCode(err);
+    this.setStatus({ kind: 'failed', version: targetVersion, code, scope: 'rollback' });
   }
 
   private setInstalling(data: {
