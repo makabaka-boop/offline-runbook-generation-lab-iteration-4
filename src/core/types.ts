@@ -58,6 +58,14 @@ export const FAILURE_TEXT: Record<FailureCode, string> = {
 
 export type InstallMode = 'full' | 'reuse';
 
+/** 紧邻上一版（已核验完整版）的缓存指针，用于“退回上一版”。 */
+export interface PreviousGeneration {
+  version: string;
+  cacheName: string;
+  /** 上一版激活代次的安装 ID；缓存名也必须携带同一 ID。 */
+  generation: string;
+}
+
 /** IndexedDB 中唯一持久化的记录（当前代际与安装状态）。 */
 export interface PersistedState {
   /** 当前已激活的完整版本；从未成功安装时为 null。 */
@@ -66,6 +74,11 @@ export interface PersistedState {
   activeCacheName: string | null;
   /** 已激活代次的唯一安装 ID；缓存名也必须携带同一 ID。 */
   activeGeneration: string | null;
+  /**
+   * 紧邻上一版的缓存指针；成功安装时最多保留当前版与上一版两份缓存。
+   * 升级前的存量记录没有该字段，按 null 处理（可正常启动，暂不能退回）。
+   */
+  previous: PreviousGeneration | null;
   /**
    * 正在进行中的安装（用于关闭后重开时识别“半包”）。
    * 一旦存在即视为中断残留，启动时清理并永不激活。
@@ -83,7 +96,24 @@ export const INITIAL_PERSISTED_STATE: PersistedState = {
   activeVersion: null,
   activeCacheName: null,
   activeGeneration: null,
+  previous: null,
   pending: null,
+};
+
+/** 退回上一版被拒绝的原因分类。 */
+export type RollbackRefuseReason =
+  | 'installing' // 安装仍在进行（本页或其他页面），不能退回
+  | 'missing' // 上一版缺失（无记录或目录中不存在）
+  | 'checksum' // 上一版缓存复核未通过
+  | 'stale' // 另一页面已完成切换，本次退回迟到
+  | 'unknown';
+
+export const ROLLBACK_REFUSE_TEXT: Record<RollbackRefuseReason, string> = {
+  installing: '安装仍在进行，不能退回上一版；当前版本继续可用',
+  missing: '没有可退回的上一版（未保留上一版完整缓存）；当前版本继续可用',
+  checksum: '上一版缓存复核未通过（SHA-256 不匹配），已拒绝退回；当前版本继续可用',
+  stale: '另一页面已完成版本切换，本次退回已取消，未覆盖新代际',
+  unknown: '退回过程中发生未知错误，已保留当前版本',
 };
 
 export type InstallerStatus =
@@ -104,9 +134,13 @@ export type InstallerStatus =
       cancelRequested: boolean;
     }
   | { kind: 'activated'; installId: string; version: string }
-  | { kind: 'failed'; installId?: string; version: string | null; code: FailureCode };
+  | { kind: 'failed'; installId?: string; version: string | null; code: FailureCode }
+  | { kind: 'rolled-back'; installId: string; version: string }
+  | { kind: 'rollback-refused'; version: string | null; reason: RollbackRefuseReason };
 
 export interface Snapshot {
   activeVersion: string | null;
+  /** 紧邻上一版版本号；为 null 时不可退回。 */
+  previousVersion: string | null;
   status: InstallerStatus;
 }

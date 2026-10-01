@@ -14,6 +14,11 @@
   摘要完全一致的已核验字节复制到新版本暂存区，只获取变化资源；即使下载地址变化，也按摘要而非 URL 复用。
 - **原子安装与切换**：一个版本的所有资源必须**全部获取/复制、逐项 SHA-256 复核，并且整份资源清单摘要通过**，
   才会写入新的“当前代际”。在此之前页面始终展示此前的完整版本。
+- **退回上一版**：成功安装时**最多保留当前版与紧邻上一版**两份缓存。退回前逐项复核上一版缓存中的
+  资源与整单摘要，确认后**一次 CAS 切换 IndexedDB 激活代际**，Service Worker、步骤页与演练会话
+  随之指向同一版本；旧版正在使用时绝不先清理其缓存。安装仍在进行、上一版缺失或校验失败时
+  **拒绝退回并保留当前可用版本**；另一标签页已抢先完成切换时，迟到的退回**不得覆盖新代际**。
+  升级前只有当前版本的存量记录可正常启动，只是暂不能退回。
 - **半包永不上线**：取消、断网、校验失败、存储配额异常，或“安装中途关闭后重开”，
   都会**清理未激活的暂存缓存**，继续展示旧版；从未成功安装时显示
   **“无可用离线包”**。
@@ -21,7 +26,7 @@
 - **离线演练**：搜索**当前版**故障条目 → **依序勾选**动作 → 得到**与版本绑定的通过结论**；
   切换版本会**终止未完成演练**。
 - 离线读取由 **Service Worker + Cache Storage** 负责；
-  **IndexedDB 只保存当前代际与安装状态**一条记录，不存手册正文。
+  **IndexedDB 只保存当前代际、紧邻上一版指针与安装状态**一条记录，不存手册正文。
 - 浏览器缺少 Service Worker / Cache Storage / IndexedDB / Web Crypto 等能力时，页面显示
   **`UNSUPPORTED`**，不降级、不提供占位实现。
 
@@ -31,11 +36,12 @@
 public/manuals/v1|v2|v3/      三个内置版本的同源资源（有序步骤 + 故障条目）
 scripts/generate-catalog.mjs 扫描资源并计算单项与整单 SHA-256，生成 src/manuals/catalog.json
 src/core/                    纯逻辑（无 DOM 依赖）
-  installer.ts               安装协调器（完整/复用获取→暂存复核→原子提交；失败/中断清理）
+  installer.ts               安装协调器（完整/复用获取→暂存复核→原子提交；失败/中断清理；
+                             退回上一版：复核上一版缓存→一次 CAS 切换代际）
   generation.ts              安装代次与缓存键名规则（页面、SW 共享）
   resource-digest.ts         整份资源清单的规范化摘要
   drill.ts                   演练：搜索、依序勾选、版本绑定结论、切版终止
-  idb.ts                     IndexedDB 仅存“当前代际 + 安装状态”
+  idb.ts                     IndexedDB 仅存“当前代际 + 上一版指针 + 安装状态”
 src/service-worker/          SW：手册只从当前激活代际缓存读取，应用壳预缓存
 src/platform/                浏览器端口（Cache/fetch/WebCrypto）、能力检测、SW 注册
 src/components/              React UI（安装管理、步骤、离线演练）
@@ -57,8 +63,8 @@ npm run dev        # http://localhost:5173（开发模式 SW 网络优先，支�
 npm run build      # 生成目录 + tsc 类型检查 + Vite 生产构建（含 SW 与预缓存清单）
 npm run preview    # 本地静态预览（默认 http://localhost:4173）
 
-npm run test       # Vitest：完整/摘要复用、取消/断网/校验/配额/中断重开/迟到代次/升级回收
-npm run e2e        # Playwright：复用安装、中断安装与离线重载、离线演练、首次失败、UNSUPPORTED
+npm run test       # Vitest：完整/摘要复用、取消/断网/校验/配额/中断重开/迟到代次/升级回收、退回切换边界
+npm run e2e        # Playwright：复用安装、中断安装与离线重载、离线演练、首次失败、UNSUPPORTED、退回上一版
 npm run verify     # 类型检查 + 单测 + 构建 + Playwright，一键全量验收
 ```
 
@@ -93,7 +99,7 @@ docker compose up --build verify
 3. 或分别清理：
    - **Service Workers** → 对本站点 **Unregister**；
    - **Cache Storage** → 删除 `shell:*`（应用壳）与所有 `manual:*`（手册代际/暂存）；
-   - **IndexedDB** → 删除 `manual-kiosk-db`（仅含当前代际与安装状态）。
+   - **IndexedDB** → 删除 `manual-kiosk-db`（仅含当前代际、上一版指针与安装状态）。
 4. **硬刷新**：Windows/Linux `Ctrl+Shift+R`，macOS `Cmd+Shift+R`。
 
 ### 2. 命令行（无头 / 自动化环境）
@@ -121,12 +127,14 @@ docker compose up -d --build web
 > 缓存命名约定：`shell:<sw-version>` 为应用壳；`manual:stage:<version>:<install-id>`
 > 为某次安装的暂存缓存。**手册请求只会命中 IndexedDB 当前指针与安装 ID 同时匹配的那一个缓存**，
 > 任何暂存/半包或迟到代次缓存对外都不可见，因此清缓存或异常中断都不会让半包顶替旧手册。
-> 新代际缓存复制了自己所需的全部字节，激活并回收旧缓存后不再引用旧版。
+> 新代际缓存复制了自己所需的全部字节，激活后不再引用旧版；成功安装时最多保留
+> **当前版与紧邻上一版**两份手册缓存（更早的孤儿缓存随即回收），上一版缓存仅供
+> “退回上一版”复核通过后切换使用，激活指针不变时对外不可见。
 
 ## 安装状态机（速查）
 
 ```
-idle ──完整安装/摘要复用──▶ installing ──全部资源与整单摘要复核通过──▶ activated（CAS 提交新代际→回收旧缓存）
+idle ──完整安装/摘要复用──▶ installing ──全部资源与整单摘要复核通过──▶ activated（CAS 提交新代际→旧激活降级为“上一版”→回收更早孤儿缓存）
                        │
                        ├─ 复用：当前版同摘要字节复制到新暂存区；变化资源正常获取
                        ├─ 取消 / abort / 迟到代次 ─▶ failed(canceled) ─┐
@@ -134,4 +142,11 @@ idle ──完整安装/摘要复用──▶ installing ──全部资源与�
                        ├─ 单项/暂存/整单摘要不符 ──▶ failed(checksum) ─┤ 已激活版本不受影响
                        └─ 容量预估/写入配额异常 ───▶ failed(quota)    ─┘
 （安装中途进程被杀 → IDB 留下 pending → 下次启动 init() 清理半包并恢复旧版）
+
+退回上一版（activated 状态下）：
+  点击“退回上一版” ─▶ 复核上一版缓存逐项 SHA-256 + 整单摘要
+    ├─ 通过 ─▶ 一次 CAS 提交（仅当 IDB 激活代次未变且无进行中安装）─▶ rolled-back
+    │          （当前版与上一版指针互换，两份缓存都保留；SW/步骤页/演练指向同一版本）
+    ├─ 安装进行中 / 上一版缺失 / 复核失败 / 存储故障 ─▶ rollback-refused（保留当前可用版本）
+    └─ 另一标签页已抢先切换 ─▶ rollback-refused(stale)（迟到退回不覆盖新代际）
 ```

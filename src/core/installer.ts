@@ -9,6 +9,9 @@
  *    界面显示“无可用离线包”。
  * 4. IndexedDB 的代际切换先于旧缓存删除（崩溃也只会留下孤儿缓存，下次启动回收）。
  * 5. 摘要复用只从当前激活代际复制字节到新暂存区；新代际激活后不引用旧缓存。
+ * 6. 成功安装时最多保留当前版与紧邻上一版两份缓存；退回上一版前逐项复核上一版缓存
+ *    与整单摘要，确认后一次 CAS 切换激活代际（SW、步骤页、演练会话随之指向同一版本）；
+ *    旧版正在使用时绝不先清理其缓存。
  */
 import type {
   CatalogEntry,
@@ -16,6 +19,7 @@ import type {
   InstallMode,
   PersistedState,
   ResourceRef,
+  RollbackRefuseReason,
   Snapshot,
 } from './types';
 import { INITIAL_PERSISTED_STATE } from './types';
@@ -69,6 +73,11 @@ export interface InstallerPorts {
   commitStateIfPending(
     state: PersistedState,
     expectedGeneration: string,
+  ): Promise<boolean>;
+  /** 仅当 IDB 当前激活代次仍等于 expectedActiveGeneration 且无进行中安装时提交回退状态。 */
+  commitStateIfActive(
+    state: PersistedState,
+    expectedActiveGeneration: string,
   ): Promise<boolean>;
   /** 下载单个资源；AbortSignal 触发时应拒绝 AbortError/Canceled。 */
   fetchResource(
@@ -134,8 +143,14 @@ interface InstallAttempt {
 
 export class InstallerCoordinator {
   private state: PersistedState = { ...INITIAL_PERSISTED_STATE };
-  private snapshot: Snapshot = { activeVersion: null, status: { kind: 'idle' } };
+  private snapshot: Snapshot = {
+    activeVersion: null,
+    previousVersion: null,
+    status: { kind: 'idle' },
+  };
   private current: InstallAttempt | null = null;
+  /** 退回流程重入保护：同一时间只允许一个退回（跨标签并发由 CAS 兜底）。 */
+  private rollingBack = false;
   /** 当前安装尝试使用的激活版本目录条目；仅按其中资源摘要定位旧版字节。 */
   private activeCatalogEntry: CatalogEntry | null = null;
   private listeners = new Set<Listener>();
@@ -154,12 +169,20 @@ export class InstallerCoordinator {
   }
 
   private emit() {
-    this.snapshot = { activeVersion: this.state.activeVersion, status: this.snapshot.status };
+    this.snapshot = {
+      activeVersion: this.state.activeVersion,
+      previousVersion: this.state.previous?.version ?? null,
+      status: this.snapshot.status,
+    };
     for (const fn of this.listeners) fn(this.snapshot);
   }
 
   private setStatus(status: Snapshot['status']) {
-    this.snapshot = { activeVersion: this.state.activeVersion, status };
+    this.snapshot = {
+      activeVersion: this.state.activeVersion,
+      previousVersion: this.state.previous?.version ?? null,
+      status,
+    };
     this.emit();
   }
 
@@ -183,12 +206,21 @@ export class InstallerCoordinator {
     }
     this.state = state;
     await this.reconcileCaches();
-    this.snapshot = { activeVersion: state.activeVersion, status: { kind: 'idle' } };
+    this.snapshot = {
+      activeVersion: state.activeVersion,
+      previousVersion: state.previous?.version ?? null,
+      status: { kind: 'idle' },
+    };
     this.emit();
   }
 
+  /** 回收孤儿缓存：仅保留当前激活缓存与紧邻上一版缓存（最多两份）。 */
   private async reconcileCaches() {
-    const keep = this.state.activeCacheName;
+    const keep = new Set(
+      [this.state.activeCacheName, this.state.previous?.cacheName].filter(
+        (name): name is string => typeof name === 'string',
+      ),
+    );
     let names: string[] = [];
     try {
       names = await this.ports.listManualCaches();
@@ -197,7 +229,7 @@ export class InstallerCoordinator {
     }
     await Promise.all(
       names
-        .filter((name) => name !== keep && name.startsWith('manual:'))
+        .filter((name) => !keep.has(name) && name.startsWith('manual:'))
         .map((name) => this.safeDelete(name)),
     );
   }
@@ -307,17 +339,26 @@ export class InstallerCoordinator {
       }
 
       // 原子切换：全部资源、逐项摘要、整单摘要均通过后才提交新代际。
+      // 成功安装时最多保留当前版与紧邻上一版：旧激活代际降级为“上一版”指针。
       const nextState: PersistedState = {
         activeVersion: version,
         activeCacheName: cacheName,
         activeGeneration: installId,
+        previous:
+          this.state.activeVersion && this.state.activeCacheName && this.state.activeGeneration
+            ? {
+                version: this.state.activeVersion,
+                cacheName: this.state.activeCacheName,
+                generation: this.state.activeGeneration,
+              }
+            : null,
         pending: null,
       };
       const committed = await this.ports.commitStateIfPending(nextState, installId);
       if (!committed) throw new StaleGenerationError();
       this.state = nextState;
 
-      // 代际已持久提交，再回收旧版与任何其他孤儿缓存（仅保留新激活缓存）。
+      // 代际已持久提交，再回收更早的孤儿缓存（保留新激活缓存与上一版缓存）。
       await this.reconcileCaches();
 
       this.current = null;
@@ -484,5 +525,139 @@ export class InstallerCoordinator {
       this.setStatus({ ...status, cancelRequested: true });
     }
     attempt.controller.abort();
+  }
+
+  /** 复核指定缓存中的资源：逐项 SHA-256 与整单摘要全部通过才返回 true。 */
+  private async verifyCachedEntry(cacheName: string, entry: CatalogEntry): Promise<boolean> {
+    try {
+      for (const ref of entry.resources) {
+        const stored = await this.ports.readCacheEntry(cacheName, ref);
+        if (!stored) return false;
+        const actual = normalizeHash(await this.ports.sha256(stored.bytes));
+        if (actual !== normalizeHash(ref.sha256)) return false;
+      }
+      const manifestActual = normalizeHash(
+        await this.ports.sha256(encodeCanonicalResourceList(entry.resources)),
+      );
+      return manifestActual === normalizeHash(entry.resourcesSha256);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 退回上一版：复核上一版缓存（逐项 SHA-256 + 整单摘要）后，一次 CAS 切换 IndexedDB
+   * 激活代际，Service Worker、步骤页与演练会话随之指向同一版本。
+   * 安装仍在进行、上一版缺失或校验失败时拒绝退回并保留当前可用版本；
+   * 另一标签页已抢先完成切换时，本次迟到退回不得覆盖新代际。
+   *
+   * @param entry 上一版在内置目录中的条目（用于复核）；目录中不存在时传 null。
+   */
+  async rollback(entry: CatalogEntry | null): Promise<void> {
+    await this.init();
+
+    const refuse = (reason: RollbackRefuseReason, version: string | null) => {
+      this.setStatus({ kind: 'rollback-refused', version, reason });
+    };
+
+    // 本页面安装仍在进行：拒绝退回。
+    if (this.current) {
+      refuse('installing', this.state.previous?.version ?? null);
+      return;
+    }
+    // 同一时间只允许一个退回；重复点击直接忽略（并发由 CAS 兜底）。
+    if (this.rollingBack) return;
+    this.rollingBack = true;
+    try {
+      await this.rollbackOnce(entry, refuse);
+    } finally {
+      this.rollingBack = false;
+    }
+  }
+
+  private async rollbackOnce(
+    entry: CatalogEntry | null,
+    refuse: (reason: RollbackRefuseReason, version: string | null) => void,
+  ): Promise<void> {
+    const stored = await this.ports.loadState();
+    this.state = stored;
+    const previous = stored.previous;
+    const current =
+      stored.activeVersion && stored.activeCacheName && stored.activeGeneration
+        ? {
+            version: stored.activeVersion,
+            cacheName: stored.activeCacheName,
+            generation: stored.activeGeneration,
+          }
+        : null;
+
+    // 其他页面安装仍在进行（IDB 存在 pending）：拒绝退回，且绝不清除其 pending。
+    if (stored.pending) {
+      refuse('installing', previous?.version ?? null);
+      return;
+    }
+    if (!current || !previous || !entry || entry.version !== previous.version) {
+      refuse('missing', previous?.version ?? null);
+      return;
+    }
+
+    // 退回前复核：上一版缓存逐项 SHA-256 + 整单摘要，全部通过才允许切换。
+    const verified = await this.verifyCachedEntry(previous.cacheName, entry);
+    if (!verified) {
+      // 复核失败：拒绝退回并保留当前可用版本。损坏的上一版缓存不得继续作为退回目标；
+      // 但仅当代际仍属于本次复核时才清理——若其他页面已抢先切换，
+      // 该缓存可能正在使用，绝不能删除。
+      const cleared: PersistedState = { ...stored, previous: null };
+      const clearedCommitted = await this.ports
+        .commitStateIfActive(cleared, current.generation)
+        .catch(() => false);
+      if (clearedCommitted) {
+        this.state = cleared;
+        await this.safeDelete(previous.cacheName);
+      } else {
+        this.state = await this.ports.loadState().catch(() => this.state);
+      }
+      refuse('checksum', previous.version);
+      return;
+    }
+
+    // 测试钩子（仅 e2e/Vitest 设置）：提交前等待，确定性构造跨标签交错；生产环境不存在。
+    const gate = (globalThis as { __MANUAL_ROLLBACK_GATE__?: () => Promise<void> })
+      .__MANUAL_ROLLBACK_GATE__;
+    if (gate) await gate();
+
+    // 一次切换：仅当 IDB 激活代次仍为我们复核时的代次才提交；
+    // 旧版（当前版）正在使用，切换提交前绝不清理其缓存。
+    const nextState: PersistedState = {
+      activeVersion: previous.version,
+      activeCacheName: previous.cacheName,
+      activeGeneration: previous.generation,
+      previous: current,
+      pending: null,
+    };
+    let committed: boolean;
+    try {
+      committed = await this.ports.commitStateIfActive(nextState, current.generation);
+    } catch {
+      // 存储故障：拒绝退回，当前可用版本保持不变。
+      this.state = await this.ports.loadState().catch(() => this.state);
+      refuse('unknown', previous.version);
+      return;
+    }
+    if (!committed) {
+      // 另一标签页已完成切换：刷新本地状态，绝不覆盖新代际。
+      this.state = await this.ports.loadState().catch(() => this.state);
+      refuse('stale', previous.version);
+      return;
+    }
+    this.state = nextState;
+
+    // 代际已持久提交：回收孤儿缓存（新激活版与刚退下的上一版都保留）。
+    await this.reconcileCaches();
+    this.setStatus({
+      kind: 'rolled-back',
+      installId: previous.generation,
+      version: previous.version,
+    });
   }
 }

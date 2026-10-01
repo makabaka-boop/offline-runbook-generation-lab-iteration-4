@@ -51,6 +51,13 @@ export async function readState(db?: IDBDatabase): Promise<PersistedState> {
       s.pending && typeof s.pending === 'object' && typeof s.pending.cacheName === 'string'
         ? s.pending.cacheName
         : null;
+    // 升级前的存量记录没有 previous 字段：按 null 处理，正常启动但暂不能退回。
+    const previousRaw =
+      s.previous && typeof s.previous === 'object'
+        ? (s.previous as Partial<PersistedState['previous'] & object>)
+        : null;
+    const previousCacheName =
+      previousRaw && typeof previousRaw.cacheName === 'string' ? previousRaw.cacheName : null;
     return {
       activeVersion: typeof s.activeVersion === 'string' ? s.activeVersion : null,
       activeCacheName,
@@ -60,6 +67,17 @@ export async function readState(db?: IDBDatabase): Promise<PersistedState> {
           : activeCacheName
             ? generationFromCacheName(activeCacheName)
             : null,
+      previous:
+        previousRaw && typeof previousRaw.version === 'string' && previousCacheName
+          ? {
+              version: previousRaw.version,
+              cacheName: previousCacheName,
+              generation:
+                typeof previousRaw.generation === 'string'
+                  ? previousRaw.generation
+                  : generationFromCacheName(previousCacheName),
+            }
+          : null,
       pending:
         s.pending &&
         typeof s.pending === 'object' &&
@@ -116,6 +134,47 @@ export async function commitStateIfPending(
         const pending = current?.pending as PersistedState['pending'] | undefined;
         if (pending?.installId !== expectedGeneration) {
           // 请求成功但代次不属于本次尝试：不能写入，也不能中止其他代次。
+          return;
+        }
+        store.put(state, KEY);
+        committed = true;
+      };
+      req.onerror = () => reject(req.error);
+      tx.oncomplete = () => resolve(committed);
+      tx.onerror = () => reject(tx.error ?? new Error('IndexedDB 提交失败'));
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB 提交中止'));
+    });
+  } finally {
+    if (owned) handle.close();
+  }
+}
+
+/**
+ * 退回上一版的原子提交：仅当 IDB 当前激活代次仍等于 expectedActiveGeneration
+ * 且没有进行中安装时，才在单个事务内写入回退后的状态。
+ * 另一标签页已抢先完成切换（安装或退回）时返回 false，绝不覆盖新代际。
+ */
+export async function commitStateIfActive(
+  state: PersistedState,
+  expectedActiveGeneration: string,
+  db?: IDBDatabase,
+): Promise<boolean> {
+  const owned = !db;
+  const handle = db ?? (await openStateDb());
+  try {
+    return await new Promise<boolean>((resolve, reject) => {
+      const tx = handle.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      let committed = false;
+      const req = store.get(KEY);
+      req.onsuccess = () => {
+        const current = req.result as Partial<PersistedState> | undefined;
+        if (
+          !current ||
+          current.activeGeneration !== expectedActiveGeneration ||
+          current.pending
+        ) {
+          // 代际已被其他页面切换，或存在进行中安装：不能写入。
           return;
         }
         store.put(state, KEY);

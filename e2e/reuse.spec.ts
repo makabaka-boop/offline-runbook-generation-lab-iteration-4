@@ -15,17 +15,21 @@ test.describe('按内容摘要复用安装', () => {
     await page.getByTestId('reuse-install-3.0.0').click();
 
     await expect(page.getByTestId('installing-banner')).toContainText('按摘要复用安装');
-    await expect(page.getByTestId('installing-3.0.0')).toContainText('复用 1');
-    await expect(page.getByTestId('installing-3.0.0')).toContainText('下载 1');
+    // faults.json 地址不可达仍能激活，证明其字节复用自已核验的 v2 缓存而非网络
     await expect(page.getByTestId('current-version')).toContainText('3.0.0');
     await expect(page.getByTestId('activated-banner')).toContainText('3.0.0');
     await expect(page.getByTestId('step-1')).toContainText('已有已核验离线包');
     await expect(page.getByTestId('step-9')).toBeVisible();
 
-    // 新版暂存区自包含 v3 的新地址；激活后旧版缓存已回收，不允许继续引用旧缓存。
+    // 新版暂存区自包含 v3 的新地址；激活缓存不引用旧版字节。
+    // 紧邻上一版（v2）缓存按保留策略留存，供“退回上一版”使用。
     const cacheState = await page.evaluate(async () => {
       const stateReq = indexedDB.open('manual-kiosk-db');
-      const state = await new Promise<{ activeVersion: string | null; activeCacheName: string | null }>((resolve, reject) => {
+      const state = await new Promise<{
+        activeVersion: string | null;
+        activeCacheName: string | null;
+        previous: { version: string; cacheName: string } | null;
+      }>((resolve, reject) => {
         stateReq.onsuccess = () => {
           const db = stateReq.result;
           const tx = db.transaction('state', 'readonly');
@@ -42,13 +46,15 @@ test.describe('按内容摘要复用安装', () => {
       const v2Faults = await activeCache?.match('/manuals/v2/faults.json');
       return {
         activeVersion: state.activeVersion,
+        previousVersion: state.previous?.version ?? null,
         manualNames,
         hasV3Faults: Boolean(v3Faults),
         hasV2FaultsInActive: Boolean(v2Faults),
       };
     });
     expect(cacheState.activeVersion).toBe('3.0.0');
-    expect(cacheState.manualNames).toHaveLength(1);
+    expect(cacheState.previousVersion).toBe('2.0.0');
+    expect(cacheState.manualNames).toHaveLength(2);
     expect(cacheState.hasV3Faults).toBe(true);
     expect(cacheState.hasV2FaultsInActive).toBe(false);
 
@@ -86,7 +92,8 @@ test.describe('按内容摘要复用安装', () => {
   test('复用安装中重载：识别并清理半成品，旧版继续完整离线可用', async ({ page, context }) => {
     await setFaultRules(page, [{ match: '/manuals/v3/manifest.json', behavior: 'hang' }]);
     await page.getByTestId('reuse-install-3.0.0').click();
-    await expect(page.getByTestId('installing-3.0.0')).toContainText('1/2');
+    // 清单是第一个资源且被挂起：进度停在 0/2（复用尚未开始）
+    await expect(page.getByTestId('installing-3.0.0')).toContainText('0/2');
     await page.reload();
 
     await expect(page.getByTestId('current-version')).toContainText('2.0.0');

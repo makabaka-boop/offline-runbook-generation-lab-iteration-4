@@ -49,6 +49,9 @@ export function Booted({ swReady }: Props) {
   const installing = snapshot.status.kind === 'installing' ? snapshot.status : null;
   const failed = snapshot.status.kind === 'failed' ? snapshot.status : null;
   const activated = snapshot.status.kind === 'activated' ? snapshot.status : null;
+  const rolledBack = snapshot.status.kind === 'rolled-back' ? snapshot.status : null;
+  const rollbackRefused = snapshot.status.kind === 'rollback-refused' ? snapshot.status : null;
+  const previousVersion = snapshot.previousVersion;
 
   const activeCatalogEntry = useMemo(
     () => (active ? findEntry(active) : undefined),
@@ -62,6 +65,12 @@ export function Booted({ swReady }: Props) {
       mode,
       activeEntry: mode === 'reuse' ? activeCatalogEntry ?? null : null,
     });
+  };
+
+  // 退回上一版：协调器复核上一版缓存后一次切换激活代际；目录缺失时传 null 会被拒绝。
+  const startRollback = () => {
+    if (!previousVersion) return;
+    void coordinator.rollback(findEntry(previousVersion) ?? null);
   };
 
   if (!ready) {
@@ -99,11 +108,15 @@ export function Booted({ swReady }: Props) {
       installing={installing}
       failed={failed as { version: string | null; code: FailureCode } | null}
       activated={activated}
+      rolledBack={rolledBack}
+      rollbackRefused={rollbackRefused}
+      previousVersion={previousVersion}
       failureText={FAILURE_TEXT}
       switchNotice={switchNotice}
       dismissSwitchNotice={() => setSwitchNotice(false)}
       onInstall={startInstall}
       onCancel={() => void coordinator.cancel()}
+      onRollback={startRollback}
     />
   );
 }

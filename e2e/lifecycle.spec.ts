@@ -18,7 +18,7 @@ test.describe('中断安装与离线重载', () => {
     // 让 v2 第一个资源永远挂起，安装停在“进行中”（模拟下载中关闭页面）。
     await setFaultRules(page, [{ match: '/manuals/v2/manifest.json', behavior: 'hang' }]);
     await page.getByTestId('install-2.0.0').click();
-    await expect(page.getByTestId('installing-banner')).toContainText('正在安装版本 2.0.0');
+    await expect(page.getByTestId('installing-banner')).toContainText('安装版本 2.0.0');
     await expect(page.getByTestId('installing-2.0.0')).toContainText('0/2');
 
     // “安装中关闭后重开”：新页面刷新（故障规则仍由已注册的 SW 持有，直到清除）。

@@ -7,7 +7,7 @@ import {
   type ManualCacheLike,
   type StagedResource,
 } from '../core/installer';
-import { commitStateIfPending, readState, writeState } from '../core/idb';
+import { commitStateIfActive, commitStateIfPending, readState, writeState } from '../core/idb';
 
 const isQuotaError = (err: unknown): boolean => {
   if (!err) return false;
@@ -34,6 +34,8 @@ export function createBrowserPorts(): InstallerPorts {
     saveState: (state: PersistedState) => writeState(state),
     commitStateIfPending: (state, generation) =>
       commitStateIfPending(state, generation),
+    commitStateIfActive: (state, activeGeneration) =>
+      commitStateIfActive(state, activeGeneration),
 
     async fetchResource(ref: ResourceRef, signal: AbortSignal) {
       const response = await fetch(ref.url, {
