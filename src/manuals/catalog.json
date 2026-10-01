@@ -1,0 +1,62 @@
+{
+  "generated": true,
+  "entries": [
+    {
+      "version": "1.0.0",
+      "releasedAt": "2025-11-03",
+      "title": "地下机房现场断电手册（基础版）",
+      "stepCount": 8,
+      "resources": [
+        {
+          "url": "/manuals/v1/manifest.json",
+          "sha256": "1b26de164c4637bd61b43355626cd7f87e5831345b673267f6a2995a4d7ed9c1",
+          "kind": "manual"
+        },
+        {
+          "url": "/manuals/v1/faults.json",
+          "sha256": "14c5d2c038004674d0c8c7d55389b9ecbb18da8774f02ddee9ccde7c9c39b45a",
+          "kind": "faults"
+        }
+      ],
+      "resourcesSha256": "d5a04ecb66cd7b007df5c9ff331465c786b6a920eeb58365a91d6a4f63c5a74c"
+    },
+    {
+      "version": "2.0.0",
+      "releasedAt": "2026-08-21",
+      "title": "地下机房现场断电手册（双总线修订版）",
+      "stepCount": 9,
+      "resources": [
+        {
+          "url": "/manuals/v2/manifest.json",
+          "sha256": "8e0338a1bc808074e223edfee4b12894e4af5d2c8e8a47096ead2bc49c5ab759",
+          "kind": "manual"
+        },
+        {
+          "url": "/manuals/v2/faults.json",
+          "sha256": "99eef01f02ee9eebcffc7189ce535b39953ad057158a99627f9ffec21a0aa69e",
+          "kind": "faults"
+        }
+      ],
+      "resourcesSha256": "29204ad987f36630d99e95cdc537a3637d8693440d2a7d8aa086a644073d0be8"
+    },
+    {
+      "version": "3.0.0",
+      "releasedAt": "2026-09-29",
+      "title": "地下机房现场断电手册（摘要复用修订版）",
+      "stepCount": 9,
+      "resources": [
+        {
+          "url": "/manuals/v3/manifest.json",
+          "sha256": "baef794af7eeeb75712e9e4712672236d6d26bec0f1205937e292f5830611d8d",
+          "kind": "manual"
+        },
+        {
+          "url": "/manuals/v3/faults.json",
+          "sha256": "99eef01f02ee9eebcffc7189ce535b39953ad057158a99627f9ffec21a0aa69e",
+          "kind": "faults"
+        }
+      ],
+      "resourcesSha256": "3bcf2841207e5e4a38b0967e314ac914afca13bfcaeaaa48378e53a5730ea65d"
+    }
+  ]
+}
